@@ -93,7 +93,7 @@ func checkErr(err error) (ok bool) {
 	case redis.Nil:
 		return false
 	default:
-		log.Panicf("rmq redis error is not nil %s", err)
+		log.Printf("rmq redis error is not nil %s", err)
 		return false
 	}
 }
