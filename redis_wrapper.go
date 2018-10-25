@@ -1,7 +1,11 @@
 package rmq
 
 import (
-	"log"
+	"fmt"
+	"os"
+	rdebug "runtime/debug"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis"
@@ -93,7 +97,13 @@ func checkErr(err error) (ok bool) {
 	case redis.Nil:
 		return false
 	default:
-		log.Printf("rmq redis error is not nil %s", err)
+		loggingJSON, _ := strconv.ParseBool(os.Getenv("loggingJSON"))
+		if loggingJSON {
+			stack := strings.Replace(strings.Replace(string(rdebug.Stack()), "\n", "    ", -1), "\t", "", -1)
+			fmt.Printf(`{"timestamp":"%s","logger":"Quiq.rmq","level":"ERROR","message":"%s","stack":"%s"}`+"\n", time.Now().Format(time.RFC3339Nano), err, stack)
+		} else {
+			fmt.Printf("rmq redis error: %s\n", err)
+		}
 		return false
 	}
 }
