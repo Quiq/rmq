@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adjust/uniuri"
@@ -33,7 +35,7 @@ type Queue interface {
 	PublishBytes(payload []byte) bool
 	SetPushQueue(pushQueue Queue)
 	StartConsuming(prefetchLimit int, pollDuration time.Duration) bool
-	StopConsuming() bool
+	StopConsuming() <-chan struct{}
 	AddConsumer(tag string, consumer Consumer) string
 	AddConsumerFunc(tag string, consumerFunc ConsumerFunc) string
 	AddBatchConsumer(tag string, batchSize int, consumer BatchConsumer) string
@@ -58,7 +60,8 @@ type redisQueue struct {
 	deliveryChan     chan Delivery // nil for publish channels, not nil for consuming channels
 	prefetchLimit    int           // max number of prefetched deliveries number of unacked can go up to prefetchLimit + numConsumers
 	pollDuration     time.Duration
-	consumingStopped bool
+	consumingStopped int32 // queue status, 1 for stopped, 0 for consuming
+	stopWg           sync.WaitGroup
 }
 
 func newQueue(name, connectionName, queuesKey string, redisClient RedisClient) *redisQueue {
@@ -72,14 +75,15 @@ func newQueue(name, connectionName, queuesKey string, redisClient RedisClient) *
 	unackedKey = strings.Replace(unackedKey, phQueue, name, 1)
 
 	queue := &redisQueue{
-		name:           name,
-		connectionName: connectionName,
-		queuesKey:      queuesKey,
-		consumersKey:   consumersKey,
-		readyKey:       readyKey,
-		rejectedKey:    rejectedKey,
-		unackedKey:     unackedKey,
-		redisClient:    redisClient,
+		name:             name,
+		connectionName:   connectionName,
+		queuesKey:        queuesKey,
+		consumersKey:     consumersKey,
+		readyKey:         readyKey,
+		rejectedKey:      rejectedKey,
+		unackedKey:       unackedKey,
+		redisClient:      redisClient,
+		consumingStopped: 1, // start with stopped status
 	}
 	return queue
 }
@@ -209,23 +213,34 @@ func (queue *redisQueue) StartConsuming(prefetchLimit int, pollDuration time.Dur
 	queue.prefetchLimit = prefetchLimit
 	queue.pollDuration = pollDuration
 	queue.deliveryChan = make(chan Delivery, prefetchLimit)
+	atomic.StoreInt32(&queue.consumingStopped, 0)
 	// log.Printf("rmq queue started consuming %s %d %s", queue, prefetchLimit, pollDuration)
 	go queue.consume()
 	return true
 }
 
-func (queue *redisQueue) StopConsuming() bool {
-	if queue.deliveryChan == nil || queue.consumingStopped {
-		return false // not consuming or already stopped
+func (queue *redisQueue) StopConsuming() <-chan struct{} {
+	finishedChan := make(chan struct{})
+	if queue.deliveryChan == nil || atomic.LoadInt32(&queue.consumingStopped) == int32(1) {
+		close(finishedChan) // not consuming or already stopped
+		return finishedChan
 	}
 
-	queue.consumingStopped = true
-	return true
+	// log.Printf("rmq queue stopping %s", queue)
+	atomic.StoreInt32(&queue.consumingStopped, 1)
+	go func() {
+		queue.stopWg.Wait()
+		close(finishedChan)
+		// log.Printf("rmq queue stopped consuming %s", queue)
+	}()
+
+	return finishedChan
 }
 
 // AddConsumer adds a consumer to the queue and returns its internal name
 // panics if StartConsuming wasn't called before!
 func (queue *redisQueue) AddConsumer(tag string, consumer Consumer) string {
+	queue.stopWg.Add(1)
 	name := queue.addConsumer(tag)
 	go queue.consumerConsume(consumer)
 	return name
@@ -243,6 +258,7 @@ func (queue *redisQueue) AddBatchConsumer(tag string, batchSize int, consumer Ba
 // Timeout limits the amount of time waiting to fill an entire batch
 // The timer is only started when the first message in a batch is received
 func (queue *redisQueue) AddBatchConsumerWithTimeout(tag string, batchSize int, timeout time.Duration, consumer BatchConsumer) string {
+	queue.stopWg.Add(1)
 	name := queue.addConsumer(tag)
 	go queue.consumerBatchConsume(batchSize, timeout, consumer)
 	return name
@@ -287,8 +303,10 @@ func (queue *redisQueue) consume() {
 			time.Sleep(queue.pollDuration)
 		}
 
-		if queue.consumingStopped {
+		if atomic.LoadInt32(&queue.consumingStopped) == int32(1) {
 			// log.Printf("rmq queue stopped consuming %s", queue)
+			close(queue.deliveryChan)
+			// log.Printf("rmq queue stopped fetching %s", queue)
 			return
 		}
 	}
@@ -330,9 +348,11 @@ func (queue *redisQueue) consumerConsume(consumer Consumer) {
 		// debug(fmt.Sprintf("consumer consume %s %s", delivery, consumer)) // COMMENTOUT
 		consumer.Consume(delivery)
 	}
+	queue.stopWg.Done()
 }
 
 func (queue *redisQueue) consumerBatchConsume(batchSize int, timeout time.Duration, consumer BatchConsumer) {
+	defer queue.stopWg.Done()
 	batch := []Delivery{}
 	for {
 		// Wait for first delivery
